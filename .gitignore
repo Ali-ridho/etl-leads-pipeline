@@ -1,0 +1,7 @@
+# Google OAuth credentials 
+credentials/oauth_client.json
+token.pickle
+
+# Python cache
+__pycache__/
+*.pyc
