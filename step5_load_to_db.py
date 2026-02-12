@@ -1,178 +1,232 @@
 import pandas as pd
-from sqlalchemy import create_engine, text
-from step4_transform import get_final_df
+import sys
+import datetime
+import os
 import time
+from sqlalchemy import create_engine, text, inspect
+from step4_transform import get_final_df
+from step3_read_gsheet import load_config 
 
-# =========================
-# CONFIG
-# =========================
-DB_USER = "root"
-DB_PASS = ""
-DB_HOST = "localhost"
-DB_PORT = "3306"
-DB_NAME = "db_mapping"
-TABLE_NAME = "leads_master"
+# ==============================
+# 📝 SISTEM LOGGING
+# ==============================
+class DualLogger(object):
+    def __init__(self):
+        self.terminal = sys.stdout
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        self.log = open(f"etl_log_{today_str}.txt", "a", encoding='utf-8')
 
-FORCE_DATE_MIGRATION = True  # SET False setelah 1x sukses
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)  
 
-# =========================
-# MAIN
-# =========================
-if __name__ == "__main__":
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
 
-    batch_ts = int(time.time())
-    df = get_final_df()
+sys.stdout = DualLogger()
+print(f"\n======== [LOG DIMULAI: {datetime.datetime.now()}] ========")
 
-    # =========================
-    # VALIDASI ID (WAJIB)
-    # =========================
-    df = df[df["lead_id"].notna()]
-    df = df[df["lead_id"].astype(str).str.strip() != ""]
-    df = df[df["lead_id"].str.match(r"^(Q4|ETA)_\d+$", na=False)]
+# ==============================
+# 1. CONFIG DATABASE
+# ==============================
+DB_USER = 'root'
+DB_PASSWORD = '' 
+DB_HOST = 'localhost'
+DB_NAME = 'db_mapping' 
+TABLE_NAME = 'leads_master_v2'
 
-    # =========================
-    # CANONICAL DATAFRAME
-    # =========================
-    df_dw = pd.DataFrame({
-        "row_no": df["No"],
-        "lead_id": df["lead_id"],
-        "entry_year": df["entry_year"],
-        "entry_month": df["entry_month"],
-        "entry_date": df["entry_date"],
-        "input_date": df["input_date"],
-        "lead_name": df["Nama"],
-        "phone_number": df["Nomor"],
-        "whatsapp_link": df["Link Whatsapp"],
-        "lead_type": df["lead_type"],
-        "product_name": df["Produk"],
-        "response": df["RESPON"],
-        "description": df["KETERANGAN"],
-        "standard_price": df["VALUE"],
-        "quantity": df["BOTOL"],
-        "unit": df["unit"],
-        "team": df["team"],
-        "row_hash": df["row_hash"],
-        "last_seen_batch": batch_ts,
-    })
+connection_string = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
+engine = create_engine(connection_string)
 
-    # =========================
-    # 🔥 FIX FINAL: NUMERIC NaN
-    # =========================
-    df_dw["entry_year"] = pd.to_numeric(df_dw["entry_year"], errors="coerce").fillna(0).astype(int)
-    df_dw["row_no"] = pd.to_numeric(df_dw["row_no"], errors="coerce").fillna(0).astype(int)
-    df_dw["quantity"] = pd.to_numeric(df_dw["quantity"], errors="coerce").fillna(0).astype(int)
+# ==============================
+# 2. HELPER FUNCTIONS
+# ==============================
 
-    df_dw["standard_price"] = (
-        df_dw["standard_price"]
-        .astype(str)
-        .str.replace("Rp", "", regex=False)
-        .str.replace(".", "", regex=False)
-        .str.replace(",", "", regex=False)
-    )
-    df_dw["standard_price"] = pd.to_numeric(df_dw["standard_price"], errors="coerce").fillna(0).astype(int)
+def smart_sync_columns(engine, df, table_name):
+    """
+    [POINT 1] AUTO ADD COLUMN
+    """
+    print("   🔍 [Auto Column] Mengecek struktur kolom database...")
+    inspector = inspect(engine)
+    
+    if not inspector.has_table(table_name):
+        return 
 
-    # non-numeric → NULL
-    df_dw = df_dw.where(pd.notna(df_dw), None)
+    existing_columns_list = [col['name'] for col in inspector.get_columns(table_name)]
+    
+    anchor_column = "" 
+    if "row_hash" in existing_columns_list:
+        idx = existing_columns_list.index("row_hash")
+        if idx > 0: anchor_column = existing_columns_list[idx - 1]
+    if not anchor_column and len(existing_columns_list) > 0:
+        anchor_column = existing_columns_list[-1]
 
-    engine = create_engine(
-        f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
-        future=True
-    )
+    new_columns_candidate = df.columns.tolist()
 
-    with engine.begin() as conn:
+    with engine.connect() as conn:
+        for col in new_columns_candidate:
+            if col not in existing_columns_list:
+                print(f"      🚀 KOLOM BARU TERDETEKSI: '{col}' belum ada di DB.")
+                col_type = "TEXT" 
+                if "date" in col or "_at" in col: col_type = "DATETIME"
+                elif "price" in col or "amount" in col or "quantity" in col or "age" in col: col_type = "DOUBLE"
+                elif "is_" in col: col_type = "BOOLEAN"
+                
+                try:
+                    position_sql = ""
+                    if anchor_column: position_sql = f"AFTER `{anchor_column}`"
+                    alter_query = text(f"ALTER TABLE {table_name} ADD COLUMN `{col}` {col_type} {position_sql}")
+                    conn.execute(alter_query)
+                    print(f"      ✅ Sukses menambahkan kolom: {col}")
+                    anchor_column = col 
+                except Exception as e:
+                    print(f"      ❌ Gagal menambahkan kolom {col}: {e}")
 
-        # =========================
-        # DATA EXISTING
-        # =========================
-        db_existing = pd.read_sql(
-            f"SELECT lead_id, row_hash FROM {TABLE_NAME}",
-            conn
-        )
+def generate_upsert_query(table_name, columns):
+    """
+    [CRITICAL FIX] URUTAN UPDATE DIPERBAIKI
+    updated_at harus diproses PERTAMA sebelum row_hash diubah oleh MySQL.
+    """
+    cols_str = ", ".join([f"`{c}`" for c in columns])
+    vals_str = ", ".join([f":{c}" for c in columns])
+    
+    # Pisahkan logika updated_at dan kolom lain
+    update_parts = []
+    updated_at_logic = ""
 
-        # =========================
-        # INSERT BARU
-        # =========================
-        df_new = df_dw[~df_dw["lead_id"].isin(db_existing["lead_id"])]
-
-        if not df_new.empty:
-            df_new.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
-
-        print(f"➕ Insert baru: {len(df_new)}")
-
-        # =========================
-        # UPDATE (CDC)
-        # =========================
-        df_compare = df_dw.merge(
-            db_existing,
-            on="lead_id",
-            how="inner",
-            suffixes=("", "_db")
-        )
-
-        if FORCE_DATE_MIGRATION:
-            df_update = df_compare
+    for col in columns:
+        # Skip PK & Created At
+        if col in ['unique_id', 'created_at']:
+            continue
+            
+        # Simpan logika updated_at secara terpisah
+        if col == 'updated_at':
+            updated_at_logic = f"`updated_at` = IF(VALUES(`row_hash`) != `row_hash`, NOW(), `updated_at`)"
+        
+        # Kolom biasa (termasuk row_hash)
         else:
-            df_update = df_compare[df_compare["row_hash"] != df_compare["row_hash_db"]]
+            update_parts.append(f"`{col}` = VALUES(`{col}`)")
+            
+    # 🔥 GABUNGKAN KEMBALI: updated_at HARUS PALING DEPAN 🔥
+    # Ini memaksa MySQL cek hash lama VS baru SEBELUM hash-nya ditimpa.
+    if updated_at_logic:
+        final_update_list = [updated_at_logic] + update_parts
+    else:
+        final_update_list = update_parts
 
-        update_sql = text(f"""
-            UPDATE {TABLE_NAME}
-            SET
-                row_no          = :row_no,
-                lead_name       = :lead_name,
-                phone_number    = :phone_number,
-                whatsapp_link   = :whatsapp_link,
-                unit            = :unit,
-                team            = :team,
-                lead_type       = :lead_type,
-                product_name    = :product_name,
-                response        = :response,
-                description     = :description,
-                standard_price  = :standard_price,
-                quantity        = :quantity,
-                entry_date      = :entry_date,
-                input_date      = :input_date,
-                entry_year      = :entry_year,
-                entry_month     = :entry_month,
-                row_hash        = :row_hash,
-                last_seen_batch = :batch
-            WHERE lead_id = :lead_id
-        """)
+    update_str = ", ".join(final_update_list)
+    
+    sql = f"""
+    INSERT INTO {table_name} ({cols_str})
+    VALUES ({vals_str})
+    ON DUPLICATE KEY UPDATE
+    {update_str};
+    """
+    return text(sql)
 
-        updated = 0
-        for _, r in df_update.iterrows():
-            res = conn.execute(update_sql, {
-                "row_no": r["row_no"],
-                "lead_name": r["lead_name"],
-                "phone_number": r["phone_number"],
-                "whatsapp_link": r["whatsapp_link"],
-                "unit": r["unit"],
-                "team": r["team"],
-                "lead_type": r["lead_type"],
-                "product_name": r["product_name"],
-                "response": r["response"],
-                "description": r["description"],
-                "standard_price": r["standard_price"],
-                "quantity": r["quantity"],
-                "entry_date": r["entry_date"],
-                "input_date": r["input_date"],
-                "entry_year": r["entry_year"],
-                "entry_month": r["entry_month"],
-                "row_hash": r["row_hash"],
-                "batch": batch_ts,
-                "lead_id": r["lead_id"],
-            })
-            updated += res.rowcount
+def sync_deletions(engine, df, table_name):
+    if df.empty: return
+    print("   🧹 Memulai Sinkronisasi Penghapusan (Sync Delete)...")
+    with engine.connect() as conn:
+        processed_sources = df['source_id'].unique().tolist()
+        for source in processed_sources:
+            current_ids = df[df['source_id'] == source]['unique_id'].tolist()
+            if not current_ids: continue
+            ids_formatted = "', '".join([str(x).replace("'", "''") for x in current_ids])
+            delete_sql = text(f"""
+                DELETE FROM {table_name} 
+                WHERE source_id = :src 
+                AND unique_id NOT IN ('{ids_formatted}')
+            """)
+            result = conn.execute(delete_sql, {"src": source})
+            conn.commit()
+            if result.rowcount > 0:
+                print(f"      🗑️  Ditemukan {result.rowcount} data sampah di '{source}'. DIHAPUS.")
 
-        print(f"🔁 Rows updated: {updated}")
+def update_inactive_status(engine, inactive_files, table_name):
+    if not inactive_files: return
+    print(f"\n   🔒 Mengunci (LOCK) {len(inactive_files)} file non-aktif...")
+    with engine.connect() as conn:
+        for source in inactive_files:
+            sql = text(f"""
+                UPDATE {table_name}
+                SET sync_status = 'LOCKED'
+                WHERE source_id = :src
+            """)
+            conn.execute(sql, {"src": source})
+            conn.commit()
 
-        # =========================
-        # HARD DELETE
-        # =========================
-        conn.execute(
-            text(f"DELETE FROM {TABLE_NAME} WHERE last_seen_batch < :b"),
-            {"b": batch_ts}
-        )
+# ==============================
+# 3. MAIN ETL PROCESS
+# ==============================
+def load_data_upsert(mode="v2"):
+    print(f"\n=== ETL START: MODE {mode.upper()} (FIX: PRIORITY UPDATE TIME) ===")
+    
+    try:
+        config_data = load_config() 
+    except Exception as e:
+        print(f"❌ Gagal load config: {e}")
+        return
 
-        print("🗑️ Hard delete selesai")
+    all_files = config_data.get(mode, {})
+    status_map = config_data.get("status_map", {}) 
+    sorted_keys = sorted(all_files.keys())
+    active_keys = [k for k in sorted_keys if status_map.get(k, True)]
+    inactive_keys = [k for k in sorted_keys if not status_map.get(k, True)]
 
-    print("✅ ETL SELESAI – DATABASE TERSINKRON")
+    print(f"   📂 Total File: {len(sorted_keys)} | ✅ Active: {len(active_keys)}")
+    
+    inspector = inspect(engine)
+    if inspector.has_table(TABLE_NAME) and inactive_keys:
+        update_inactive_status(engine, inactive_keys, TABLE_NAME)
+
+    df = get_final_df(mode_selection=mode)
+    
+    if df.empty:
+        print("⚠️ Tidak ada data ACTIVE yang terbaca.")
+        return
+
+    df_active = df[df['source_id'].isin(active_keys)].copy()
+    
+    if df_active.empty:
+        print("⚠️ Data ditemukan, tapi tidak ada yang statusnya Active.")
+        return
+
+    print(f"   🚀 Memproses {len(df_active)} baris data AKTIF...")
+    df_active['sync_status'] = 'ACTIVE'
+    
+    smart_sync_columns(engine, df_active, TABLE_NAME)
+
+    df_final = df_active.where(pd.notnull(df_active), None)
+
+    try:
+        if inspector.has_table(TABLE_NAME):
+            sync_deletions(engine, df_final, TABLE_NAME)
+    except Exception as e:
+        print(f"⚠️ Gagal Sync Delete: {e}")
+
+    data_to_insert = df_final.to_dict(orient='records')
+    if not data_to_insert: return
+
+    query = generate_upsert_query(TABLE_NAME, df_final.columns.tolist())
+    
+    batch_size = 1000
+    total_inserted = 0
+    
+    with engine.connect() as conn:
+        print("   🔌 Terhubung ke Database. Memulai Batch Processing...")
+        for i in range(0, len(data_to_insert), batch_size):
+            batch = data_to_insert[i : i + batch_size]
+            try:
+                conn.execute(query, batch)
+                conn.commit()
+                print(f"      📦 Batch {i} - {i+len(batch)} sukses diproses...")
+                total_inserted += len(batch)
+            except Exception as e:
+                print(f"      ❌ Error batch {i}: {e}")
+
+    print(f"\n🎉 SUKSES! Total Data Aktif Terproses: {total_inserted}")
+
+if __name__ == "__main__":
+    load_data_upsert("v2")

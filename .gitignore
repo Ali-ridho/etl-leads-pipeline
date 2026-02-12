@@ -5,3 +5,9 @@ token.pickle
 # Python cache
 __pycache__/
 *.pyc
+
+service_account.json
+client_secret.json
+credentials.json
+*.txt
+*.log

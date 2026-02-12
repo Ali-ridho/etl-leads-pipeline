@@ -26,3 +26,23 @@ sheet_eta = client.open_by_key(
 ws_eta = sheet_eta.sheet1
 print("ETA Title:", sheet_eta.title)
 print("ETA Rows:", ws_eta.row_count)
+
+
+
+from sqlalchemy import create_engine
+
+engine = create_engine(DB_CONNECTION)
+
+df_final = get_final_df()
+
+print("INSERTING:", len(df_final), "rows")
+
+df_final.to_sql(
+    "leads_master",
+    engine,
+    if_exists="append",
+    index=False,
+    chunksize=500
+)
+
+print("✅ INSERT SELESAI")
