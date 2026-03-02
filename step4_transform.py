@@ -161,16 +161,7 @@ def transform_v1(df, source_type):
 def transform_v2_direct(df, source_label):
     print(f"   ... Memproses {source_label} (Awal: {len(df)} baris)...")
     
-    # [POINT 4] WARNING SYSTEM (SEBELUM PERBAIKAN)
-    # Memberi peringatan jika user memakai spasi/huruf besar
-    raw_columns = df.columns.astype(str).tolist()
-    for col in raw_columns:
-        if " " in col or any(x.isupper() for x in col):
-            print(f"   ⚠️ [PERINGATAN] Format kolom salah: '{col}'")
-            print(f"      -> Mengandung spasi atau huruf besar.")
-            print(f"      -> Sistem akan otomatis mengubahnya ke 'snake_case'.")
-
-    # [POINT 4] OTOMASI PERBAIKAN NAMA KOLOM
+    # 1. OTOMASI PERBAIKAN NAMA KOLOM
     df = df.copy()
     df.columns = (
         df.columns.astype(str)
@@ -178,74 +169,82 @@ def transform_v2_direct(df, source_label):
         .str.lower()
         .str.replace(")", "", regex=False)
         .str.replace("(", "", regex=False)
-        .str.replace(" ", "_", regex=False) # Spasi jadi underscore
-        .str.replace(r"[^a-z0-9_]", "", regex=True) # Hapus karakter aneh
+        .str.replace(" ", "_", regex=False)
+        .str.replace(r"[^a-z0-9_]", "", regex=True)
     )
 
-    # Cek Duplikat
     if df.columns.duplicated().any():
         dupes = df.columns[df.columns.duplicated()].tolist()
         print(f"❌ [FATAL ERROR] Ditemukan Kolom Duplikat di {source_label}: {dupes}")
         return pd.DataFrame() 
 
-    # Koreksi Value
+    # Koreksi Value & Rename
     df = df.replace("LP-PB Everpro", "LT Everpro", regex=False)
     df.rename(columns=V2_COLUMN_MAP, inplace=True)
     df = df.loc[:, ~df.columns.duplicated()]
+
+    # ==========================================
+    # STEP A: CLEANING DULU (Hapus sampah)
+    # ==========================================
     
-    # Basic Formatting
-    if "row" not in df.columns: df["row"] = range(1, len(df)+ 1)
+    # Filter Khusus (Cleaning)
     if "part 1" in source_label.lower():
         if "lead_name" in df.columns:
             df["lead_name"] = df["lead_name"].apply(clean_garbage_name)
-            df = df[df["lead_name"].notna()] 
-        df = df[df["row"].astype(str).str.strip() != ""]
+            #df = df[df["lead_name"].notna()]
+        
+        # Hapus baris yang benar-benar kosong
+        #cols_check = [c for c in df.columns if c in ["lead_name","phone_number","entry_date"]]
+        #if cols_check:
+            #df = df.dropna(subset=cols_check, how='all')
 
+    # ==========================================
+    # STEP B: PENOMORAN (Setelah Data Bersih)
+    # ==========================================
+    
+    # Reset index agar mulai dari 0 tanpa ada gap/angka loncat
+    df = df.reset_index(drop=True)
+    
+    # Beri nomor row mulai dari 1
+    df["row"] = df.index + 1 
+    
+    # Buat Unique ID & Source ID
     df["row"] = pd.to_numeric(df["row"], errors='coerce').fillna(0).astype(int)
     df["source_id"] = source_label
     df["unique_id"] = df["source_id"] + "_" + df["row"].astype(str).str.zfill(5)
+    
+    # ==========================================
 
+    # Formatting Date & Phone
     for col in ["entry_date", "input_date"]:
-        if col in df.columns: df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
+        if col in df.columns: 
+            df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
 
     if 'phone_number' in df.columns:
         df['phone_number'] = df['phone_number'].apply(clean_phone_number)
             
-    # ==========================================================
-    # [POINT 3 & FIX POINT 2] DYNAMIC ROW HASH YANG STABIL
-    # ==========================================================
-    
-    # 1. Ambil SEMUA kolom data (kecuali system)
+    # Hash Calculation
     current_df_cols = [c for c in df.columns.tolist() if 'unnamed' not in c]
     data_columns = [c for c in current_df_cols if c not in SYSTEM_COLUMNS]
-    
-    # 🔥 CRITICAL FIX: SORTIR KOLOM 🔥
-    # Ini kuncinya! Kita urutkan kolom secara alfabet (A-Z).
-    # Jadi walau di GSheet urutannya "Nama, Umur" dan besok "Umur, Nama",
-    # Hash-nya akan tetap SAMA (karena diurutkan jadi "Nama, Umur" sebelum dihitung).
     data_columns.sort()
     
-    # 2. Generate Hash dari data_columns yang sudah disortir
     if not df.empty:
-        # Fungsi ini akan membaca seluruh kolom baru secara otomatis
         df["row_hash"] = df.apply(lambda row: generate_dynamic_row_hash(row, data_columns), axis=1)
     else:
         df["row_hash"] = None
 
-    # Tambahkan Timestamp
+    # Timestamp & System Columns
     now = datetime.now()
     df["created_at"] = now
     df["updated_at"] = now
     df["sync_status"] = "synced"
 
-    # Reordering: Data dulu, baru System
     final_column_order = data_columns + SYSTEM_COLUMNS
     for sys_col in SYSTEM_COLUMNS:
         if sys_col not in df.columns: df[sys_col] = None
 
     final_df = df.reindex(columns=final_column_order)
     return final_df
-
 # ==============================
 # 5. MAIN EXECUTION
 # ==============================

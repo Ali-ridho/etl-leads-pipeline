@@ -5,7 +5,7 @@ import os
 import time
 from sqlalchemy import create_engine, text, inspect
 from step4_transform import get_final_df
-from step3_read_gsheet import load_config 
+from step3_read_gsheet import load_config  
 
 # ==============================
 # 📝 SISTEM LOGGING
@@ -102,7 +102,8 @@ def generate_upsert_query(table_name, columns):
             
         # Simpan logika updated_at secara terpisah
         if col == 'updated_at':
-            updated_at_logic = f"`updated_at` = IF(VALUES(`row_hash`) != `row_hash`, NOW(), `updated_at`)"
+            # 🔥 INI BARIS YANG DIUBAH: Tambahan OR untuk mengecek perubahan status 🔥
+            updated_at_logic = f"`updated_at` = IF(VALUES(`row_hash`) != `row_hash` OR VALUES(`sync_status`) != `sync_status`, NOW(), `updated_at`)"
         
         # Kolom biasa (termasuk row_hash)
         else:
@@ -151,8 +152,10 @@ def update_inactive_status(engine, inactive_files, table_name):
         for source in inactive_files:
             sql = text(f"""
                 UPDATE {table_name}
-                SET sync_status = 'LOCKED'
+                SET sync_status = 'LOCKED',
+                    updated_at = NOW()
                 WHERE source_id = :src
+                AND (sync_status != 'LOCKED' OR sync_status IS NULL)
             """)
             conn.execute(sql, {"src": source})
             conn.commit()
