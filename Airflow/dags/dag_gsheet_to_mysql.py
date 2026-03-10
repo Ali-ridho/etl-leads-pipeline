@@ -29,55 +29,64 @@ with DAG(
         from airflow.models import Variable
         
         # ==========================================
-        # 1. AUTHENTICATION
+        # 1. AUTHENTICATION & KONFIGURASI
         # ==========================================
+        PROJECT_NAME = "insert_lead" # <-- Filter Project untuk DAG ini
+        
         print("🤖 Menggunakan Kredensial dari Airflow Variables!")
         creds_json = Variable.get("google_sheets_config", deserialize_json=True)
         client = gspread.service_account_from_dict(creds_json)
 
         # ==========================================
-        # 2. BACA MASTER CONFIG
+        # 2. BACA MASTER CONFIG (VERSI ANTI-BADAI)
         # ==========================================
         MASTER_CONFIG_ID = "1uEsOg6UgKfLhbULyvgKYS0pVX22SEChUPdUu7FTrZPQ" 
-        MASTER_TAB_NAME = "Sheet1" 
+        MASTER_TAB_NAME = "insert_lead" 
         
         print(f"📡 Mengambil daftar file dari Master Config...")
         sh = client.open_by_key(MASTER_CONFIG_ID)
         ws = sh.worksheet(MASTER_TAB_NAME)
-        all_rows = ws.get_all_values()
+        
+        # Menggunakan get_all_records() agar kebal pergeseran kolom!
+        all_configs = ws.get_all_records() 
         
         clean_list = []
-        if len(all_rows) >= 2:
-            for i, row in enumerate(all_rows[1:]):
-                if not any(row): continue
-                while len(row) < 4: row.append("")
+        for i, row in enumerate(all_configs):
+            project_col = str(row.get('Project', '')).strip().lower()
+            label = str(row.get('LABEL', '')).strip()
+            s_id = str(row.get('Spreadsheet_ID', '')).strip()
+            tab_name = str(row.get('Tab_Name', '')).strip()
+            status_raw = str(row.get('Status', '')).strip().upper()
+            
+            # 1. FILTER: Abaikan jika project-nya bukan "insert_lead"
+            if project_col != PROJECT_NAME.lower():
+                continue
                 
-                label = str(row[0]).strip()
-                s_id = str(row[1]).strip()
-                tab_name = str(row[2]).strip()
-                status_raw = str(row[3]).strip().upper()
+            if not s_id or not label:
+                continue
                 
-                # TENTUKAN STATUS AKTIF ATAU TERKUNCI
-                if status_raw in ["FALSE", "OFF"]:
-                    print(f" 🔴 [BARIS {i+2}] {label} -> STATUS: LOCKED (Skip! Jangan dibaca isi GSheet-nya!)")
-                    continue
-                else:
-                    print(f" 🟢 [BARIS {i+2}] {label} -> STATUS: ACTIVE")
-                    final_status = "ACTIVE"
-                    
-                if s_id:
-                    clean_list.append({
-                        "label": label, 
-                        "id": s_id, 
-                        "tab_name": tab_name, 
-                        "status_dari_config": final_status
-                    })
+            # 2. TENTUKAN STATUS AKTIF ATAU TERKUNCI
+            if status_raw in ["FALSE", "OFF"]:
+                print(f" 🔴 [BARIS {i+2}] {label} -> STATUS: LOCKED (Skip!)")
+                continue
+            else:
+                print(f" 🟢 [BARIS {i+2}] {label} -> STATUS: ACTIVE")
+                clean_list.append({
+                    "label": label, 
+                    "id": s_id, 
+                    "tab_name": tab_name, 
+                    "status_dari_config": "ACTIVE"
+                })
                     
         # ==========================================
         # 3. EXTRACT DATA BERSALURAN
         # ==========================================
         extracted_data = {} 
         
+        if not clean_list:
+            print(f"⚠️ Tidak ada data GSheet yang aktif untuk project {PROJECT_NAME}")
+            return extracted_data
+            
         for file_info in clean_list:
             label = file_info['label']
             sheet_id = file_info['id']
@@ -101,6 +110,10 @@ with DAG(
                 headers = [str(h).strip() for h in values[header_row]]
                 rows = values[header_row + 1 :]
                 df = pd.DataFrame(rows, columns=headers)
+                
+                # --- JURUS PEMBERSIH NULL (Sudah aktif!) ---
+                df = df.replace(r'^\s*$', None, regex=True)
+                df = df.replace("", None)
                 
                 # Normalisasi nama kolom
                 df.columns = df.columns.str.strip()
@@ -241,7 +254,6 @@ with DAG(
     def load_to_mysql(final_data):
         import pandas as pd
         from sqlalchemy import text, inspect, create_engine
-        from airflow.providers.mysql.hooks.mysql import MySqlHook
 
         # ==========================================
         # 1. KONEKSI DATABASE & CEK ALL-LOCKED
