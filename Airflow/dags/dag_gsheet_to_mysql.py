@@ -40,12 +40,16 @@ with DAG(
         # ==========================================
         # 2. BACA MASTER CONFIG (VERSI ANTI-BADAI)
         # ==========================================
-        MASTER_CONFIG_ID = "1uEsOg6UgKfLhbULyvgKYS0pVX22SEChUPdUu7FTrZPQ" 
-        MASTER_TAB_NAME = "insert_lead" 
-        
+
         print(f"📡 Mengambil daftar file dari Master Config...")
-        sh = client.open_by_key(MASTER_CONFIG_ID)
-        ws = sh.worksheet(MASTER_TAB_NAME)
+        
+        master_config = Variable.get("master_config_sheet", deserialize_json=True)
+        
+        sh = client.open_by_key(master_config['config_sheet_id'])
+        tab_key_name = f"{PROJECT_NAME}_tab"
+        master_tab = master_config.get(tab_key_name)
+        
+        ws = sh.worksheet(master_tab)
         
         # Menggunakan get_all_records() agar kebal pergeseran kolom!
         all_configs = ws.get_all_records() 
