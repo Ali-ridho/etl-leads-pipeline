@@ -7,12 +7,12 @@ import json
 import pendulum
 
 # =========================================================================
-# TEMPLATE REUSABLE ETL: GOOGLE SHEETS TO MYSQL 
+# 🌟 TEMPLATE REUSABLE ETL: GOOGLE SHEETS TO MYSQL (V6 - ULTIMATE) 🌟
 # =========================================================================
 
-PROJECT_NAME = "everpro"               # <-- Ganti menjadi "insert_lead" jika nama tab di GSheet adalah insert_lead_tab
-TARGET_TABLE = "everpro_leads_raw_data"  # <-- Ganti dengan nama tabel tujuan untuk insert_lead
-SOURCE_PK_COLUMN = "id"                # <-- Sesuaikan dengan kolom utama di GSheet insert_lead
+PROJECT_NAME = "contents"            # Nama Project di Master Config GSheet
+TARGET_TABLE = "contents_raw_data"   # Nama Tabel Tujuan di MySQL/MariaDB
+SOURCE_PK_COLUMN = "no"              # Kolom utama di GSheet (Khusus Contents)
 
 
 default_args = {
@@ -99,7 +99,7 @@ with DAG(
         import hashlib
         import re
         import pendulum
-        import json 
+        import json # Wajib import json untuk The JSON Hack
 
         extracted_data = payload.get("active_data", {})
         inactive_labels = payload.get("inactive_labels", [])        
@@ -191,28 +191,29 @@ with DAG(
         else:
             return {"final_data": [], "inactive_labels": inactive_labels}
     
+
     @task
     def load_to_mysql(payload):
         import pandas as pd
         import math
         from sqlalchemy import text, inspect, create_engine
         
-        # 👇 1. TAMBAHKAN IMPORT INI 👇
+        # 👇 TAMBAHAN IMPORT NULLPOOL 👇
         from sqlalchemy.pool import NullPool 
         
         final_data = payload.get("final_data", [])
         inactive_labels = payload.get("inactive_labels", [])
         
-        # 👇 2. GUNAKAN NULLPOOL (Mencegah Docker menyimpan koneksi mati) 👇
+        # 👇 ENGINE ANTI DOCKER TIMEOUT 👇
         engine = create_engine(
-            "mysql+pymysql://root:@host.docker.internal:3306/db_mapping", 
+            "mysql+pymysql://root:@host.docker.internal:3306/db_mapping",
             poolclass=NullPool
         )
+        
+        # --- PINDAHKAN INSPECTOR KE ATAS ---
         inspector = inspect(engine)
 
-        # ... (KODE DI BAWAHNYA TETAP SAMA MENGGUNAKAN with engine.connect() as conn: ) ...
-
-        # 👇 2. GANTI begin() dengan connect() MENCEGAH CRASH ROLLBACK
+        # Cek: Lakukan UPDATE FALSE HANYA JIKA tabelnya sudah tercipta!
         if inactive_labels and inspector.has_table(TARGET_TABLE):
             try:
                 with engine.connect() as conn:
@@ -228,8 +229,10 @@ with DAG(
             print("⚠️ Tidak ada data ACTIVE untuk di-insert/upsert.")
             return "Selesai (Hanya update status)"
 
+        # Schema only untuk baca kolom
         df_schema = pd.DataFrame(final_data) 
 
+        # --- AUTO CREATE TABLE DENGAN PRIMARY KEY UNIQUE_ID ---
         if not inspector.has_table(TARGET_TABLE):
             print(f" 🏗️ Membangun tabel awal {TARGET_TABLE}...")
             df_schema.head(0).to_sql(TARGET_TABLE, con=engine, if_exists='replace', index=False)
@@ -240,8 +243,10 @@ with DAG(
                     conn.commit()
             except Exception as e:
                 pass
+        # ------------------------------------------------------
       
         def smart_sync_columns(engine, df_cols, table_name):
+            # (Pastikan inspector dipanggil lagi di dalam fungsi helper)
             _inspector = inspect(engine)
             existing_columns_list = [col['name'] for col in _inspector.get_columns(table_name)]
             anchor_column = existing_columns_list[-1] if existing_columns_list else ""
@@ -312,6 +317,9 @@ with DAG(
         query = generate_upsert_query(TARGET_TABLE, list(final_data[0].keys()))
         batch_size = 1000
 
+        # =========================================================================
+        # 🔥 TRIK "PALU GODAM": CUCI SEMUA VALUE JADI TIPE DATA MURNI SEBELUM INSERT
+        # =========================================================================
         clean_data_to_insert = []
         for row in final_data:
             clean_row = {}
@@ -325,6 +333,7 @@ with DAG(
                 else:
                     clean_row[k] = v
             clean_data_to_insert.append(clean_row)
+        # =========================================================================
 
         for i in range(0, len(clean_data_to_insert), batch_size):
             batch = clean_data_to_insert[i : i + batch_size]
@@ -337,7 +346,7 @@ with DAG(
                 
         print("🎉 SUKSES BESAR! Data UPSERT selesai.")
         return "Selesai 100%"
-
+         
     # === PEMANGGILAN TASK ===
     data_raw = extract_from_gsheet()
     data_clean = transform_data(data_raw)

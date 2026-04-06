@@ -7,16 +7,13 @@ import json
 import pendulum
 
 # =========================================================================
-# 🌟 TEMPLATE REUSABLE ETL: GOOGLE SHEETS TO MYSQL (V4 - SYNC STATUS) 🌟
+# TEMPLATE REUSABLE ETL: GOOGLE SHEETS TO MYSQL
 # =========================================================================
 
-# ==========================================
-# 1. KONFIGURASI PROJECT UTAMA (KUSUS CTWA)
-# ==========================================
 PROJECT_NAME = "ctwa"                  # Nama Project di Master Config GSheet
 TARGET_TABLE = "ctwa_leads_raw_data"   # Nama Tabel Tujuan di MySQL/MariaDB
-CONFIG_TAB_NAME = "CTWA_leads"         # Nama Tab di Master Config GSheet (Huruf kapital)
-# =========================================================================
+SOURCE_PK_COLUMN = "id"
+
 
 default_args = {
     'owner': 'ridho_intern',
@@ -45,7 +42,10 @@ with DAG(
         master_config = Variable.get("master_config_sheet", deserialize_json=True)
 
         sh = client.open_by_key(master_config['config_sheet_id'])
-        ws = sh.worksheet(CONFIG_TAB_NAME)
+        tab_key_name = f"{PROJECT_NAME}_tab"
+        master_tab = master_config.get(tab_key_name)
+        
+        ws = sh.worksheet(master_tab)
         all_configs = ws.get_all_records() 
         
         clean_list = []
@@ -99,13 +99,13 @@ with DAG(
         import hashlib
         import re
         import pendulum
+        import json # Wajib import json untuk The JSON Hack
 
         extracted_data = payload.get("active_data", {})
         inactive_labels = payload.get("inactive_labels", [])        
         
         print("⚙️ Memulai proses Transformasi Data...")
-        
-        SYSTEM_COLUMNS = ["source_sheet", "row_hash", "created_at", "updated_at", "sync"]
+        SYSTEM_COLUMNS = ["source_sheet", "row_hash", "created_at", "updated_at", "sync", "unique_id"]
 
         def clean_phone_number(phone):
             if pd.isna(phone) or str(phone).strip() == "": return None
@@ -129,9 +129,24 @@ with DAG(
                           .str.replace(")", "", regex=False).str.replace("(", "", regex=False)
                           .str.replace(" ", "_", regex=False).str.replace(r"[^a-z0-9_]", "", regex=True))
 
-            df = df.loc[:, ~df.columns.duplicated()]
+            # --- MESIN TRANSLASI PK DINAMIS ---
+            pk_source = SOURCE_PK_COLUMN.lower().strip().replace(" ", "_")
+            if pk_source in df.columns and pk_source != 'id':
+                df.rename(columns={pk_source: 'id'}, inplace=True)
+            elif 'id' not in df.columns and len(df.columns) > 0:
+                df.rename(columns={df.columns[0]: 'id'}, inplace=True)
+            # ----------------------------------
 
+            df = df.loc[:, ~df.columns.duplicated()]
             df["source_sheet"] = source_label
+            
+            # --- PEMBUATAN UNIQUE ID ANTI-TABRAKAN ---
+            if 'id' in df.columns:
+                df["unique_id"] = df["source_sheet"] + "_" + df["id"].astype(str).str.zfill(5)
+            else:
+                df["unique_id"] = df["source_sheet"] + "_" + df.index.astype(str).str.zfill(5)
+            
+            # -----------------------------------------
             
             if 'phone_number' in df.columns:
                 df.rename(columns={'phone_number': 'phone_numl'}, inplace=True)
@@ -158,65 +173,97 @@ with DAG(
             df["updated_at"] = now_str
 
             final_dfs.append(df)
-
+        
         if final_dfs:
             result = pd.concat(final_dfs, ignore_index=True)
 
+            # --- DYNAMIC TYPE CASTING & AUTO-SORTING ---
             if 'id' in result.columns:
-                result['id_num'] = pd.to_numeric(result['id'], errors='coerce')
-                result = result.sort_values(by=['source_sheet', 'id_num'], ascending=[True, True])
-                result.drop(columns=['id_num'], inplace=True)
+                result['id'] = pd.to_numeric(result['id'], downcast='integer', errors='ignore')
+                result = result.sort_values(by=['source_sheet', 'id'], ascending=[True, True])
+            # -------------------------------------------
 
-            result = result.replace({np.nan: None})
-            final_data = result.to_dict(orient='records')
+            # --- JARING PENANGKAP NaN: THE JSON HACK ---
+            # 1. Konversi ke JSON. Pandas TERPAKSA merubah NaN menjadi 'null' standar web
+            json_str = result.to_json(orient='records', date_format='iso')
+            
+            # 2. Baca kembali JSON tersebut. Python akan merubah 'null' menjadi None murni!
+            final_data = json.loads(json_str)
+            # -------------------------------------------
+
             return {"final_data": final_data, "inactive_labels": inactive_labels}
         else:
             return {"final_data": [], "inactive_labels": inactive_labels}
-
+    
+        
     @task
     def load_to_mysql(payload):
         import pandas as pd
+        import math
         from sqlalchemy import text, inspect, create_engine
+        
+        # 👇 TAMBAHAN IMPORT NULLPOOL 👇
+        from sqlalchemy.pool import NullPool 
         
         final_data = payload.get("final_data", [])
         inactive_labels = payload.get("inactive_labels", [])
         
-        engine = create_engine("mysql+pymysql://root:@host.docker.internal:3306/db_mapping")
+        # 👇 ENGINE ANTI DOCKER TIMEOUT 👇
+        engine = create_engine(
+            "mysql+pymysql://root:@host.docker.internal:3306/db_mapping",
+            poolclass=NullPool
+        )
+        inspector = inspect(engine)
 
-        # EKSEKUSI STATUS FALSE PALING AWAL
-        if inactive_labels:
-            with engine.begin() as conn:
-                inactive_str = "', '".join([str(x).replace("'", "''") for x in inactive_labels])
-                update_inactive_sql = text(f"UPDATE {TARGET_TABLE} SET sync = 'FALSE' WHERE source_sheet IN ('{inactive_str}')")
-                conn.execute(update_inactive_sql)
-                print(f"🔴 Berhasil mematikan status (FALSE) untuk: {inactive_labels}")
+        if inactive_labels and inspector.has_table(TARGET_TABLE):
+            try:
+                with engine.connect() as conn:
+                    inactive_str = "', '".join([str(x).replace("'", "''") for x in inactive_labels])
+                    update_inactive_sql = text(f"UPDATE {TARGET_TABLE} SET sync = 'FALSE', updated_at = NOW() WHERE source_sheet IN ('{inactive_str}')")
+                    conn.execute(update_inactive_sql)
+                    conn.commit()
+                    print(f"🔴 Berhasil mematikan status (FALSE) dan update waktu untuk: {inactive_labels}")
+            except Exception as e:
+                print(f"⚠️ Gagal update status inactive: {e}")
 
         if not final_data:
             print("⚠️ Tidak ada data ACTIVE untuk di-insert/upsert.")
             return "Selesai (Hanya update status)"
 
-        df_final = pd.DataFrame(final_data) 
+        df_schema = pd.DataFrame(final_data) 
 
-        def smart_sync_columns(engine, df, table_name):
-            inspector = inspect(engine)
-            existing_columns_list = [col['name'] for col in inspector.get_columns(table_name)]
+        if not inspector.has_table(TARGET_TABLE):
+            print(f" 🏗️ Membangun tabel awal {TARGET_TABLE}...")
+            df_schema.head(0).to_sql(TARGET_TABLE, con=engine, if_exists='replace', index=False)
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text(f"ALTER TABLE {TARGET_TABLE} MODIFY `unique_id` VARCHAR(255) NOT NULL;"))
+                    conn.execute(text(f"ALTER TABLE {TARGET_TABLE} ADD PRIMARY KEY (`unique_id`);"))
+                    conn.commit()
+            except Exception as e:
+                pass
+      
+        def smart_sync_columns(engine, df_cols, table_name):
+            _inspector = inspect(engine)
+            existing_columns_list = [col['name'] for col in _inspector.get_columns(table_name)]
             anchor_column = existing_columns_list[-1] if existing_columns_list else ""
-            new_columns_candidate = df.columns.tolist()
+            new_columns_candidate = df_cols
 
-            with engine.begin() as conn:
-                for col in new_columns_candidate:
-                    if col not in existing_columns_list:
-                        col_type = "TEXT" 
-                        if "date" in col or "_at" in col: col_type = "DATETIME"
-                        elif "price" in col or "amount" in col or "quantity" in col: col_type = "DOUBLE"
-                        
-                        try:
-                            position_sql = f"AFTER `{anchor_column}`" if anchor_column else ""
-                            alter_query = text(f"ALTER TABLE {table_name} ADD COLUMN `{col}` {col_type} {position_sql}")
+            for col in new_columns_candidate:
+                if col not in existing_columns_list:
+                    col_type = "TEXT" 
+                    if "date" in col or "_at" in col: col_type = "DATETIME"
+                    elif "price" in col or "amount" in col or "quantity" in col: col_type = "DOUBLE"
+                    
+                    try:
+                        position_sql = f"AFTER `{anchor_column}`" if anchor_column else ""
+                        alter_query = text(f"ALTER TABLE {table_name} ADD COLUMN `{col}` {col_type} {position_sql}")
+                        with engine.connect() as conn:
                             conn.execute(alter_query)
-                            anchor_column = col 
-                        except Exception as e:
-                            pass
+                            conn.commit()
+                        anchor_column = col 
+                    except Exception as e:
+                        pass
 
         def generate_upsert_query(table_name, columns):
             cols_str = ", ".join([f"`{c}`" for c in columns])
@@ -226,7 +273,7 @@ with DAG(
             updated_at_logic = ""
 
             for col in columns:
-                if col in ['id', 'source_sheet', 'created_at']: continue
+                if col in ['unique_id', 'id', 'source_sheet', 'created_at']: continue
                 if col == 'updated_at':
                     updated_at_logic = f"`updated_at` = IF(VALUES(`row_hash`) != `row_hash` OR VALUES(`sync`) != `sync`, NOW(), `updated_at`)"
                 else:
@@ -242,35 +289,57 @@ with DAG(
             """
             return text(sql)
 
-        def sync_deletions(engine, df, table_name):
-            if df.empty: return
-            with engine.begin() as conn:
-                processed_sources = df['source_sheet'].unique().tolist()
-                for source in processed_sources:
-                    current_ids = df[df['source_sheet'] == source]['id'].astype(str).tolist()
-                    if not current_ids: continue
-                    ids_formatted = "', '".join([str(x).replace("'", "''") for x in current_ids])
-                    delete_sql = text(f"""
-                        DELETE FROM {table_name} 
-                        WHERE source_sheet = :src AND id NOT IN ('{ids_formatted}')
-                    """)
-                    conn.execute(delete_sql, {"src": source})
+        def sync_deletions(engine, data_list, table_name):
+            if not data_list: return
+            processed_sources = list(set([row.get('source_sheet') for row in data_list]))
+            for source in processed_sources:
+                current_ids = [str(row.get('unique_id')) for row in data_list if row.get('source_sheet') == source]
+                if not current_ids: continue
+                ids_formatted = "', '".join([str(x).replace("'", "''") for x in current_ids])
+                delete_sql = text(f"""
+                    DELETE FROM {table_name} 
+                    WHERE source_sheet = :src AND unique_id NOT IN ('{ids_formatted}')
+                """)
+                
+                try:
+                    with engine.connect() as conn:
+                        conn.execute(delete_sql, {"src": source})
+                        conn.commit()
+                except Exception as e:
+                    print(f"⚠️ Gagal delete di source {source}: {e}")
 
-        smart_sync_columns(engine, df_final, TARGET_TABLE)
-        sync_deletions(engine, df_final, TARGET_TABLE)
+        smart_sync_columns(engine, list(final_data[0].keys()), TARGET_TABLE)
+        sync_deletions(engine, final_data, TARGET_TABLE)
 
-        data_to_insert = df_final.to_dict(orient='records')
-        query = generate_upsert_query(TARGET_TABLE, df_final.columns.tolist())
+        query = generate_upsert_query(TARGET_TABLE, list(final_data[0].keys()))
         batch_size = 1000
 
-        with engine.begin() as conn:
-            for i in range(0, len(data_to_insert), batch_size):
-                batch = data_to_insert[i : i + batch_size]
-                conn.execute(query, batch)
+        clean_data_to_insert = []
+        for row in final_data:
+            clean_row = {}
+            for k, v in row.items():
+                if v is None:
+                    clean_row[k] = None
+                elif isinstance(v, float) and math.isnan(v):
+                    clean_row[k] = None
+                elif isinstance(v, float) and v.is_integer():
+                    clean_row[k] = int(v)
+                else:
+                    clean_row[k] = v
+            clean_data_to_insert.append(clean_row)
+
+        for i in range(0, len(clean_data_to_insert), batch_size):
+            batch = clean_data_to_insert[i : i + batch_size]
+            try:
+                with engine.connect() as conn:
+                    conn.execute(query, batch)
+                    conn.commit()
+            except Exception as e:
+                print(f"⚠️ Gagal insert batch data: {e}")
                 
         print("🎉 SUKSES BESAR! Data UPSERT selesai.")
         return "Selesai 100%"
-
+    
     data_raw = extract_from_gsheet()
     data_clean = transform_data(data_raw)
     load_to_mysql(data_clean)
